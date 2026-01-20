@@ -15,7 +15,7 @@ CAP Viewer is a custom viewer built on top of aitviewer for reviewing SMPLX anim
 
 ## Layout
 
-The viewer uses a **floating panel layout** (方案3):
+The viewer uses a **floating panel layout**:
 - Main window: Full 3D SMPLX animation view
 - Floating panels: Foot Pressure and EMG videos (can be dragged and resized)
 
