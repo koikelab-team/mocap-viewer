@@ -25,6 +25,7 @@ if _parent_dir not in sys.path:
 
 from aitviewer.viewer import Viewer
 from aitviewer.renderables.smpl import SMPLSequence
+from aitviewer.scene.camera import OpenCVCamera
 
 try:
     from convert_animation import convert_to_aitviewer_format
@@ -127,6 +128,8 @@ class CapViewer(Viewer):
         smplx_path: str,
         foot_pressure_path: Optional[str] = None,
         emg_path: Optional[str] = None,
+        camera_info_path: Optional[str] = None,
+        camera_images_path: Optional[str] = None,
         **kwargs
     ):
         """
@@ -136,6 +139,8 @@ class CapViewer(Viewer):
             smplx_path: Path to SMPLX animation file (.npz)
             foot_pressure_path: Optional path to foot pressure video file
             emg_path: Optional path to EMG signal video file
+            camera_info_path: Optional path to camera info .npz file (with intrinsics, extrinsics, etc.)
+            camera_images_path: Optional path to directory containing camera images
             **kwargs: Additional arguments passed to Viewer
         """
         super().__init__(title="CAP Viewer - SMPLX with Foot Pressure & EMG", **kwargs)
@@ -184,9 +189,23 @@ class CapViewer(Viewer):
         self.foot_pressure_texture = None
         self.emg_texture = None
         
+        # Camera system
+        self.cameras = []
+        self.camera_images_path = camera_images_path
+        self.camera_textures = {}  # Dict mapping camera index to texture
+        self.show_cameras = {}  # Dict mapping camera index to visibility flag
+        self.show_camera_frustums = True  # Global flag for showing camera frustums
+        
+        # Load cameras if provided
+        if camera_info_path and os.path.exists(camera_info_path):
+            self._load_cameras(camera_info_path)
+        
         # Add custom GUI controls
         self.gui_controls["foot_pressure"] = self.gui_foot_pressure
         self.gui_controls["emg"] = self.gui_emg
+        if self.cameras:
+            self.gui_controls["cameras"] = self.gui_cameras
+            self.gui_controls["camera_settings"] = self.gui_camera_settings
     
     def _load_smplx_from_pkl(self, pkl_path):
         """
@@ -254,6 +273,136 @@ class CapViewer(Viewer):
         
         print("SMPLSequence created successfully!")
         return seq
+    
+    def _load_cameras(self, camera_info_path: str):
+        """
+        Load OpenCV cameras from camera info file.
+        
+        Args:
+            camera_info_path: Path to .npz file with camera intrinsics, extrinsics, etc.
+        """
+        print(f"Loading cameras from: {camera_info_path}")
+        try:
+            camera_info = np.load(camera_info_path)
+            
+            # Extract camera data
+            ids = camera_info.get("ids", None)
+            intrinsics = camera_info.get("intrinsics", None)
+            extrinsics = camera_info.get("extrinsics", None)
+            dist_coeffs = camera_info.get("dist_coeffs", None)
+            
+            if intrinsics is None or extrinsics is None:
+                print("Warning: Camera info file missing intrinsics or extrinsics")
+                return
+            
+            # Ensure proper shape
+            if len(intrinsics.shape) == 2:
+                intrinsics = intrinsics[np.newaxis, ...]
+            if len(extrinsics.shape) == 2:
+                extrinsics = extrinsics[np.newaxis, ...]
+            
+            # Get image dimensions (default to 1920x1080 if not specified)
+            cols = camera_info.get("cols", 1920)
+            rows = camera_info.get("rows", 1080)
+            
+            num_cameras = intrinsics.shape[0]
+            print(f"Loading {num_cameras} cameras...")
+            
+            for i in range(num_cameras):
+                cam_id = ids[i] if ids is not None else i
+                K = intrinsics[i]
+                Rt = extrinsics[i]
+                dist = dist_coeffs[i] if dist_coeffs is not None else None
+                
+                # Create OpenCV camera
+                camera = OpenCVCamera(
+                    K=K,
+                    Rt=Rt,
+                    cols=cols,
+                    rows=rows,
+                    dist_coeffs=dist,
+                    viewer=self,
+                    name=f"Camera {cam_id}"
+                )
+                
+                # Show frustum (camera viewing range)
+                try:
+                    # Use far plane distance as frustum distance, or default to 10.0
+                    frustum_distance = camera.far if camera.far is not None else 10.0
+                    camera.show_frustum(cols, rows, frustum_distance)
+                    print(f"  Enabled frustum for Camera {cam_id} (distance: {frustum_distance:.2f})")
+                except Exception as e:
+                    print(f"  Warning: Could not show frustum for Camera {cam_id}: {e}")
+                
+                self.cameras.append(camera)
+                self.scene.add(camera)
+                self.show_cameras[i] = True
+                self.camera_textures[i] = None
+                
+                print(f"  Added Camera {cam_id}")
+            
+            print(f"Successfully loaded {len(self.cameras)} cameras")
+            
+        except Exception as e:
+            print(f"Error loading cameras: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _load_camera_image(self, camera_index: int, frame_id: int) -> Optional[np.ndarray]:
+        """
+        Load image for a specific camera and frame.
+        
+        Args:
+            camera_index: Index of the camera
+            frame_id: Frame index
+            
+        Returns:
+            Image as numpy array (RGB format), or None if unavailable
+        """
+        if not self.camera_images_path or camera_index >= len(self.cameras):
+            return None
+        
+        try:
+            camera = self.cameras[camera_index]
+            cam_id = camera.name.split()[-1] if "Camera" in camera.name else str(camera_index)
+            
+            # Try to find image file
+            camera_dir = os.path.join(self.camera_images_path, str(cam_id))
+            if not os.path.isdir(camera_dir):
+                # Try with camera index
+                camera_dir = os.path.join(self.camera_images_path, str(camera_index))
+            
+            if not os.path.isdir(camera_dir):
+                return None
+            
+            # Look for image files (common extensions)
+            import glob
+            image_files = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                image_files.extend(glob.glob(os.path.join(camera_dir, ext)))
+            
+            if not image_files:
+                return None
+            
+            # Sort by filename
+            image_files.sort()
+            
+            # Map frame_id to image file
+            if frame_id >= len(image_files):
+                frame_id = len(image_files) - 1
+            
+            image_path = image_files[frame_id]
+            img = cv2.imread(image_path)
+            
+            if img is not None:
+                # Convert BGR to RGB
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                return img_rgb
+            
+        except Exception as e:
+            print(f"Error loading camera image: {e}")
+        
+        return None
     
     def gui_foot_pressure(self):
         """GUI panel for foot pressure video."""
@@ -395,6 +544,159 @@ class CapViewer(Viewer):
         
         imgui.end()
     
+    def gui_cameras(self):
+        """GUI panel for camera views."""
+        if not self.cameras:
+            return
+        
+        # Create window for each camera
+        for i, camera in enumerate(self.cameras):
+            if i not in self.show_cameras or not self.show_cameras[i]:
+                continue
+            
+            # Set window position and size
+            window_x = 50 + (i % 2) * 450
+            window_y = 400 + (i // 2) * 350
+            imgui.set_next_window_position(
+                window_x,
+                window_y,
+                imgui.FIRST_USE_EVER
+            )
+            imgui.set_next_window_size(
+                400,
+                300,
+                imgui.FIRST_USE_EVER
+            )
+            
+            # Create window
+            window_name = f"{camera.name}##camera_{i}"
+            expanded, self.show_cameras[i] = imgui.begin(
+                window_name,
+                self.show_cameras[i]
+            )
+            
+            if expanded:
+                # Get current frame from SMPLX sequence
+                current_frame = self.scene.current_frame_id
+                
+                # Load camera image
+                frame = self._load_camera_image(i, current_frame)
+                
+                if frame is not None:
+                    # Update texture if frame changed
+                    if (i not in self.camera_textures or 
+                        self.camera_textures[i] is None or
+                        current_frame != getattr(camera, '_last_frame_id', -1)):
+                        self._update_camera_texture(frame, i)
+                        camera._last_frame_id = current_frame
+                    
+                    # Display frame info
+                    imgui.text(f"Frame: {current_frame}/{self.scene.n_frames - 1}")
+                    imgui.text(f"Camera: {camera.name}")
+                    
+                    # Display camera image
+                    if i in self.camera_textures and self.camera_textures[i] is not None:
+                        # Get available width
+                        avail_width = imgui.get_content_region_available()[0]
+                        
+                        # Calculate display size maintaining aspect ratio
+                        aspect_ratio = camera.cols / max(1, camera.rows)
+                        display_height = min(avail_width / aspect_ratio, 250)
+                        display_width = display_height * aspect_ratio
+                        
+                        # Display image using texture's OpenGL ID
+                        imgui.image(
+                            self.camera_textures[i].glo,
+                            display_width,
+                            display_height
+                        )
+                else:
+                    imgui.text("No camera image available")
+                    imgui.text(f"Camera images path: {self.camera_images_path}")
+            
+            imgui.end()
+    
+    def gui_camera_settings(self):
+        """GUI panel for camera settings."""
+        if not self.cameras:
+            return
+        
+        # Set window position and size
+        imgui.set_next_window_position(50, 50, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(300, 150, imgui.FIRST_USE_EVER)
+        
+        # Create window
+        expanded, _ = imgui.begin("Camera Settings##camera_settings", True)
+        
+        if expanded:
+            imgui.text(f"Total Cameras: {len(self.cameras)}")
+            imgui.spacing()
+            
+            # Toggle frustum display for all cameras
+            changed, self.show_camera_frustums = imgui.checkbox(
+                "Show Camera Frustums", 
+                self.show_camera_frustums
+            )
+            
+            if changed:
+                for i, camera in enumerate(self.cameras):
+                    if self.show_camera_frustums:
+                        try:
+                            frustum_distance = camera.far if camera.far is not None else 10.0
+                            camera.show_frustum(camera.cols, camera.rows, frustum_distance)
+                        except Exception as e:
+                            print(f"Warning: Could not show frustum for Camera {i}: {e}")
+                    else:
+                        try:
+                            camera.hide_frustum()
+                        except Exception as e:
+                            print(f"Warning: Could not hide frustum for Camera {i}: {e}")
+            
+            imgui.spacing()
+            imgui.text("Right-click on cameras in the")
+            imgui.text("scene to toggle individual")
+            imgui.text("camera frustums.")
+        
+        imgui.end()
+    
+    def _update_camera_texture(self, frame: np.ndarray, camera_index: int):
+        """
+        Update texture for camera image display.
+        
+        Args:
+            frame: Camera image frame as numpy array (RGB format)
+            camera_index: Index of the camera
+        """
+        if frame is None:
+            return
+        
+        # Convert to uint8 if needed
+        if frame.dtype != np.uint8:
+            frame = (frame * 255).astype(np.uint8)
+        
+        # Ensure RGB format
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            height, width = frame.shape[:2]
+            channels = 3
+        else:
+            return
+        
+        # Create or update texture
+        try:
+            if camera_index in self.camera_textures and self.camera_textures[camera_index] is not None:
+                self.camera_textures[camera_index].release()
+            
+            self.camera_textures[camera_index] = self.ctx.texture(
+                (width, height),
+                channels,
+                frame.tobytes()
+            )
+            # Register texture with imgui renderer (if method exists)
+            if hasattr(self.imgui, 'register_texture'):
+                self.imgui.register_texture(self.camera_textures[camera_index])
+        except Exception as e:
+            print(f"Error updating camera {camera_index} texture: {e}")
+    
     def _map_frame_to_video(
         self,
         smplx_frame: int,
@@ -503,6 +805,17 @@ class CapViewer(Viewer):
                     if frame is not None:
                         self._update_video_texture(frame, "emg")
                         self.emg_player.current_frame_id = video_frame_id
+            
+            # Update camera images
+            if self.cameras and self.camera_images_path:
+                for i, camera in enumerate(self.cameras):
+                    if i in self.show_cameras and self.show_cameras[i]:
+                        last_frame = getattr(camera, '_last_frame_id', -1)
+                        if current_frame != last_frame:
+                            frame = self._load_camera_image(i, current_frame)
+                            if frame is not None:
+                                self._update_camera_texture(frame, i)
+                                camera._last_frame_id = current_frame
         
         return result
     
@@ -517,6 +830,11 @@ class CapViewer(Viewer):
             self.foot_pressure_texture.release()
         if self.emg_texture is not None:
             self.emg_texture.release()
+        
+        # Release camera textures
+        for texture in self.camera_textures.values():
+            if texture is not None:
+                texture.release()
         
         super().release()
 

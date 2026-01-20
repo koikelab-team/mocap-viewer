@@ -17,6 +17,8 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 from capviewer import CapViewer
+from aitviewer.scene.camera import OpenCVCamera
+from aitviewer.renderables.billboard import Billboard
 
 
 def viridis_colormap(value):
@@ -178,6 +180,261 @@ def generate_insole_mp4_from_pkl(pkl_path, output_path=None, fps=10):
     return output_path
 
 
+def extract_frames_from_video(video_path, max_frames=None):
+    """
+    Extract frames from video file.
+    
+    Args:
+        video_path: Path to video file
+        max_frames: Maximum number of frames to extract (None for all)
+        
+    Returns:
+        List of frames as numpy arrays (RGB format)
+    """
+    if not os.path.exists(video_path):
+        print(f"Warning: Video file not found: {video_path}")
+        return []
+    
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame_rgb)
+        frame_count += 1
+        
+        if max_frames is not None and frame_count >= max_frames:
+            break
+    
+    cap.release()
+    print(f"Extracted {len(frames)} frames from {video_path}")
+    return frames
+
+
+def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_position=None):
+    """
+    Create a single camera with video billboard.
+    
+    Args:
+        viewer: The viewer instance
+        video_path: Path to video file
+        distance: Distance from camera for billboard
+        camera_position: Camera position [x, y, z] (None for default)
+        
+    Returns:
+        Tuple of (camera, billboard)
+    """
+    # Extract frames from video
+    frames = extract_frames_from_video(video_path)
+    if not frames:
+        print("Error: No frames extracted from video")
+        return None, None
+    
+    # Get video dimensions from first frame
+    first_frame = frames[0]
+    rows, cols = first_frame.shape[:2]
+    
+    # Default camera position
+    if camera_position is None:
+        camera_position = np.array([5.0, 1.5, 5.0], dtype=np.float32)
+    
+    # Camera looks at origin
+    target = np.array([0.0, 0.0, 0.0])
+    position = np.array(camera_position, dtype=np.float32)
+    
+    # Compute camera extrinsics (OpenCV format)
+    # Forward vector (points from camera to target, normalized)
+    forward = target - position
+    forward = forward / (np.linalg.norm(forward) + 1e-8)
+    
+    # World up vector
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    
+    # Right vector (perpendicular to forward and world_up)
+    right = np.cross(forward, world_up)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-8:
+        # If forward is parallel to world_up, use a different up
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        right = np.cross(forward, world_up)
+        right_norm = np.linalg.norm(right)
+    right = right / (right_norm + 1e-8)
+    
+    # Down vector (negative of up, perpendicular to right and forward)
+    down = -np.cross(right, forward)
+    down = down / (np.linalg.norm(down) + 1e-8)
+    
+    # OpenCV camera: Rt = [R|t] where:
+    # - R rows are: right, down, forward (in world coordinates)
+    # - t = -R @ position
+    R = np.array([
+        right,
+        down,
+        forward
+    ], dtype=np.float32)
+    
+    # Translation: t = -R @ position
+    t = -R @ position
+    
+    # Extrinsics matrix [R|t]
+    Rt = np.hstack([R, t.reshape(3, 1)]).astype(np.float32)
+    
+    # Intrinsics (simple pinhole camera)
+    fov = 60  # degrees
+    f = max(cols, rows) / 2.0 / np.tan(np.radians(fov / 2))
+    K = np.array([
+        [f, 0, cols / 2],
+        [0, f, rows / 2],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    
+    # Create OpenCV camera with n_frames matching video
+    num_frames = len(frames)
+    
+    # Expand K and Rt to match number of frames
+    K_expanded = np.repeat(K[np.newaxis, ...], num_frames, axis=0)
+    Rt_expanded = np.repeat(Rt[np.newaxis, ...], num_frames, axis=0)
+    
+    camera = OpenCVCamera(
+        K=K_expanded,
+        Rt=Rt_expanded,
+        cols=cols,
+        rows=rows,
+        viewer=viewer,
+        name="Camera"
+    )
+    
+    # Show frustum (camera viewing range)
+    try:
+        frustum_distance = camera.far if camera.far is not None else distance
+        camera.show_frustum(cols, rows, frustum_distance)
+        print(f"  Enabled frustum for Camera (distance: {frustum_distance:.2f})")
+    except Exception as e:
+        print(f"  Warning: Could not show frustum for Camera: {e}")
+    
+    # Create billboard from camera and video frames
+    # Convert frames list to numpy array for Billboard
+    # Billboard expects frames in shape (N, H, W, C) where C is channels (RGB)
+    frames_array = np.array(frames)  # Shape: (N, H, W, 3)
+    
+    print(f"  Creating billboard with {num_frames} frames at distance {distance}")
+    billboard = Billboard.from_camera_and_distance(
+        camera,
+        distance,
+        cols,
+        rows,
+        frames_array,  # Pass frames as numpy array
+    )
+    
+    return camera, billboard
+
+
+def create_example_cameras(viewer, num_cameras=4, distance=5.0):
+    """
+    Create example cameras around the scene for visualization.
+    
+    Args:
+        viewer: The viewer instance
+        num_cameras: Number of cameras to create
+        distance: Distance from origin for cameras
+        
+    Returns:
+        List of created cameras
+    """
+    cameras = []
+    cols, rows = 1920, 1080
+    
+    # Create cameras in a circle around the origin
+    for i in range(num_cameras):
+        angle = 2 * np.pi * i / num_cameras
+        
+        # Camera position
+        x = distance * np.cos(angle)
+        y = 1.5  # Height
+        z = distance * np.sin(angle)
+        
+        # Camera looks at origin
+        target = np.array([0.0, 0.0, 0.0])
+        position = np.array([x, y, z], dtype=np.float32)
+        
+        # Compute camera extrinsics (OpenCV format)
+        # Forward vector (points from camera to target, normalized)
+        forward = target - position
+        forward = forward / (np.linalg.norm(forward) + 1e-8)
+        
+        # World up vector
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        
+        # Right vector (perpendicular to forward and world_up)
+        right = np.cross(forward, world_up)
+        right_norm = np.linalg.norm(right)
+        if right_norm < 1e-8:
+            # If forward is parallel to world_up, use a different up
+            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            right = np.cross(forward, world_up)
+            right_norm = np.linalg.norm(right)
+        right = right / (right_norm + 1e-8)
+        
+        # Down vector (negative of up, perpendicular to right and forward)
+        down = -np.cross(right, forward)
+        down = down / (np.linalg.norm(down) + 1e-8)
+        
+        # OpenCV camera: Rt = [R|t] where:
+        # - R rows are: right, down, forward (in world coordinates)
+        # - t = -R @ position
+        R = np.array([
+            right,
+            down,
+            forward
+        ], dtype=np.float32)
+        
+        # Translation: t = -R @ position
+        t = -R @ position
+        
+        # Extrinsics matrix [R|t]
+        Rt = np.hstack([R, t.reshape(3, 1)]).astype(np.float32)
+        
+        # Intrinsics (simple pinhole camera)
+        fov = 60  # degrees
+        f = max(cols, rows) / 2.0 / np.tan(np.radians(fov / 2))
+        K = np.array([
+            [f, 0, cols / 2],
+            [0, f, rows / 2],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        # Create OpenCV camera
+        camera = OpenCVCamera(
+            K=K,
+            Rt=Rt,
+            cols=cols,
+            rows=rows,
+            viewer=viewer,
+            name=f"Camera {i}"
+        )
+        
+        # Show frustum (camera viewing range)
+        try:
+            # Use far plane distance as frustum distance, or default to 10.0
+            frustum_distance = camera.far if camera.far is not None else 10.0
+            camera.show_frustum(cols, rows, frustum_distance)
+            print(f"  Enabled frustum for Camera {i} (distance: {frustum_distance:.2f})")
+        except Exception as e:
+            print(f"  Warning: Could not show frustum for Camera {i}: {e}")
+        
+        cameras.append(camera)
+        viewer.scene.add(camera)
+        print(f"Created example camera {i} at position ({x:.2f}, {y:.2f}, {z:.2f}) with frustum")
+    
+    return cameras
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="View dummy SMPLX motion with optional Foot Pressure & EMG")
     parser.add_argument(
@@ -197,6 +454,29 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to EMG signal video file (optional)"
+    )
+    parser.add_argument(
+        "--camera-info",
+        type=str,
+        default=None,
+        help="Path to camera info .npz file (with intrinsics, extrinsics, etc.) (optional)"
+    )
+    parser.add_argument(
+        "--camera-images",
+        type=str,
+        default=None,
+        help="Path to directory containing camera images (optional)"
+    )
+    parser.add_argument(
+        "--create-example-cameras",
+        action="store_true",
+        help="Create example cameras around the scene if no camera info is provided"
+    )
+    parser.add_argument(
+        "--camera-video",
+        type=str,
+        default=None,
+        help="Path to camera video file (e.g., MP4) to display on billboard"
     )
     
     args = parser.parse_args()
@@ -239,7 +519,51 @@ if __name__ == "__main__":
         smplx_path=args.pkl_path,
         foot_pressure_path=foot_pressure_path,
         emg_path=args.emg,
+        camera_info_path=args.camera_info,
+        camera_images_path=args.camera_images,
     )
+    
+    # Create single camera with video if provided
+    if args.camera_video:
+        if not os.path.exists(args.camera_video):
+            print(f"Error: Camera video file not found: {args.camera_video}")
+            sys.exit(1)
+        
+        print(f"Creating camera with video: {args.camera_video}")
+        camera, billboard = create_single_camera_with_video(
+            viewer, 
+            args.camera_video, 
+            distance=5.0
+        )
+        
+        if camera is not None and billboard is not None:
+            viewer.scene.add(camera, billboard)
+            # Add to viewer's camera list for GUI
+            viewer.cameras.append(camera)
+            viewer.show_cameras[0] = True
+            viewer.camera_textures[0] = None
+            # Enable camera GUI
+            if "cameras" not in viewer.gui_controls:
+                viewer.gui_controls["cameras"] = viewer.gui_cameras
+            if "camera_settings" not in viewer.gui_controls:
+                viewer.gui_controls["camera_settings"] = viewer.gui_camera_settings
+            print("Camera and billboard added to scene")
+        else:
+            print("Error: Failed to create camera with video")
+    
+    # Create example cameras if requested and no camera info provided
+    elif args.create_example_cameras and not args.camera_info:
+        print("Creating example cameras...")
+        example_cameras = create_example_cameras(viewer, num_cameras=4, distance=5.0)
+        # Add cameras to viewer's camera list
+        viewer.cameras.extend(example_cameras)
+        for i in range(len(example_cameras)):
+            idx = len(viewer.cameras) - len(example_cameras) + i
+            viewer.show_cameras[idx] = True
+            viewer.camera_textures[idx] = None
+        # Enable camera GUI
+        if "cameras" not in viewer.gui_controls:
+            viewer.gui_controls["cameras"] = viewer.gui_cameras
     
     viewer.run_animations = True
     viewer.playback_fps = 30.0
