@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import pickle
 from PIL import Image, ImageDraw
+from scipy.spatial.transform import Rotation as R
 
 # Add parent directory to path
 _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -180,6 +181,121 @@ def generate_insole_mp4_from_pkl(pkl_path, output_path=None, fps=10):
     return output_path
 
 
+def load_extri_yml(extri_path, camera_id=1):
+    """
+    Load camera extrinsics from OpenCV YAML file.
+    
+    Args:
+        extri_path: Path to extri.yml file
+        camera_id: Camera ID (1-9, default: 1)
+        
+    Returns:
+        Tuple of (Rot, T) where:
+        - Rot: 3x3 rotation matrix
+        - T: 3x1 translation vector
+    """
+    if not os.path.exists(extri_path):
+        print(f"Warning: Extri file not found: {extri_path}")
+        return None, None
+    
+    try:
+        fs = cv2.FileStorage(extri_path, cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            print(f"Error: Failed to open extri file: {extri_path}")
+            return None, None
+        
+        # Load rotation matrix and translation vector
+        rot_key = f"Rot_{camera_id}"
+        t_key = f"T_{camera_id}"
+        
+        rot_node = fs.getNode(rot_key)
+        t_node = fs.getNode(t_key)
+        
+        if rot_node.empty() or t_node.empty():
+            print(f"Error: Camera {camera_id} extrinsics not found in {extri_path}")
+            fs.release()
+            return None, None
+        
+        Rot = rot_node.mat()
+        T = t_node.mat()
+        
+        fs.release()
+        
+        # Ensure T is a column vector (3, 1)
+        if T.shape[0] == 1:
+            T = T.T
+        if len(T.shape) == 1:
+            T = T.reshape(-1, 1)
+        
+        print(f"Loaded extrinsics for camera {camera_id} from {extri_path}")
+        print(f"  Rot shape: {Rot.shape}, T shape: {T.shape}")
+        
+        return Rot, T
+    except Exception as e:
+        print(f"Error loading extri file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+
+def load_intri_yml(intri_path, camera_id=1):
+    """
+    Load camera intrinsics from OpenCV YAML file.
+    
+    Args:
+        intri_path: Path to intri.yml file
+        camera_id: Camera ID (1-9, default: 1)
+        
+    Returns:
+        Tuple of (K, dist_coeffs) where:
+        - K: 3x3 camera intrinsic matrix
+        - dist_coeffs: 5x1 distortion coefficients (or None if not found)
+    """
+    if not os.path.exists(intri_path):
+        print(f"Warning: Intri file not found: {intri_path}")
+        return None, None
+    
+    try:
+        fs = cv2.FileStorage(intri_path, cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            print(f"Error: Failed to open intri file: {intri_path}")
+            return None, None
+        
+        # Load intrinsic matrix and distortion coefficients
+        k_key = f"K_{camera_id}"
+        dist_key = f"dist_{camera_id}"
+        
+        k_node = fs.getNode(k_key)
+        dist_node = fs.getNode(dist_key)
+        
+        if k_node.empty():
+            print(f"Error: Camera {camera_id} intrinsics not found in {intri_path}")
+            fs.release()
+            return None, None
+        
+        K = k_node.mat()
+        
+        # Distortion coefficients are optional
+        dist_coeffs = None
+        if not dist_node.empty():
+            dist_coeffs = dist_node.mat()
+            # Ensure dist_coeffs is a 1D array (5,)
+            if len(dist_coeffs.shape) > 1:
+                dist_coeffs = dist_coeffs.flatten()
+        
+        fs.release()
+        
+        print(f"Loaded intrinsics for camera {camera_id} from {intri_path}")
+        print(f"  K shape: {K.shape}, dist_coeffs shape: {dist_coeffs.shape if dist_coeffs is not None else None}")
+        
+        return K, dist_coeffs
+    except Exception as e:
+        print(f"Error loading intri file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+
 def extract_frames_from_video(video_path, max_frames=None):
     """
     Extract frames from video file.
@@ -217,7 +333,7 @@ def extract_frames_from_video(video_path, max_frames=None):
     return frames
 
 
-def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_position=None):
+def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_position=None, extri_path=None, intri_path=None, camera_id=1):
     """
     Create a single camera with video billboard.
     
@@ -225,7 +341,9 @@ def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_pos
         viewer: The viewer instance
         video_path: Path to video file
         distance: Distance from camera for billboard
-        camera_position: Camera position [x, y, z] (None for default)
+        camera_position: Camera position [x, y, z] (None for default, ignored if extri_path is provided)
+        extri_path: Path to extri.yml file with camera extrinsics (optional)
+        camera_id: Camera ID to use from extri.yml (default: 1)
         
     Returns:
         Tuple of (camera, billboard)
@@ -240,59 +358,114 @@ def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_pos
     first_frame = frames[0]
     rows, cols = first_frame.shape[:2]
     
-    # Default camera position
-    if camera_position is None:
-        camera_position = np.array([5.0, 1.5, 5.0], dtype=np.float32)
+    # Load extrinsics from extri.yml if provided
+    if extri_path is not None:
+        Rot, T = load_extri_yml(extri_path, camera_id)
+        if Rot is not None and T is not None:
+            # Apply coordinate system transformation: rot_x_-90 (rotate -90 degrees around X axis)
+            # This MUST match the rotation applied to SMPLX model in capviewer.py
+            # Both SMPLX and camera extrinsics must have the same transformation to maintain relative positions
+            rot_x_minus_90 = R.from_euler('x', -90, degrees=True).as_matrix()
+            
+            # Apply rotation to the rotation matrix: R_new = R_transform @ R_old
+            # This matches apply_rotation_matrix_to_aa in json_to_pkl_parser.py (line 77)
+            Rot_transformed = (rot_x_minus_90 @ Rot).astype(np.float32)
+            
+            # For translation vector T: T is world-to-camera translation
+            # When we rotate the coordinate system, we need to transform T accordingly
+            # But if direction is correct and only position is wrong, try not rotating T
+            # Ensure T is column vector for matrix multiplication
+            if T.shape[1] != 1:
+                T = T.reshape(-1, 1)
+            
+            # Try: don't rotate T, use original T
+            # This might fix the position issue while keeping the correct direction
+            Rot_cam = Rot_transformed
+            t = T.astype(np.float32)  # Use original T without rotation
+            
+            # Extrinsics matrix [R|t]
+            Rt = np.hstack([Rot_cam, t]).astype(np.float32)
+            print(f"Using extrinsics from extri.yml for camera {camera_id} (with rot_x_-90, matching SMPLX rotation)")
+        else:
+            print("Warning: Failed to load extrinsics, using default camera position")
+            extri_path = None  # Fall back to default
     
-    # Camera looks at origin
-    target = np.array([0.0, 0.0, 0.0])
-    position = np.array(camera_position, dtype=np.float32)
-    
-    # Compute camera extrinsics (OpenCV format)
-    # Forward vector (points from camera to target, normalized)
-    forward = target - position
-    forward = forward / (np.linalg.norm(forward) + 1e-8)
-    
-    # World up vector
-    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    
-    # Right vector (perpendicular to forward and world_up)
-    right = np.cross(forward, world_up)
-    right_norm = np.linalg.norm(right)
-    if right_norm < 1e-8:
-        # If forward is parallel to world_up, use a different up
-        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    # Use default camera position calculation if extri_path not provided or failed
+    if extri_path is None:
+        # Default camera position
+        if camera_position is None:
+            camera_position = np.array([5.0, 1.5, 5.0], dtype=np.float32)
+        
+        # Camera looks at origin
+        target = np.array([0.0, 0.0, 0.0])
+        position = np.array(camera_position, dtype=np.float32)
+        
+        # Compute camera extrinsics (OpenCV format)
+        # Forward vector (points from camera to target, normalized)
+        forward = target - position
+        forward = forward / (np.linalg.norm(forward) + 1e-8)
+        
+        # World up vector
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        
+        # Right vector (perpendicular to forward and world_up)
         right = np.cross(forward, world_up)
         right_norm = np.linalg.norm(right)
-    right = right / (right_norm + 1e-8)
+        if right_norm < 1e-8:
+            # If forward is parallel to world_up, use a different up
+            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            right = np.cross(forward, world_up)
+            right_norm = np.linalg.norm(right)
+        right = right / (right_norm + 1e-8)
+        
+        # Down vector (negative of up, perpendicular to right and forward)
+        down = -np.cross(right, forward)
+        down = down / (np.linalg.norm(down) + 1e-8)
+        
+        # OpenCV camera: Rt = [R|t] where:
+        # - R rows are: right, down, forward (in world coordinates)
+        # - t = -R @ position
+        R_cam = np.array([
+            right,
+            down,
+            forward
+        ], dtype=np.float32)
+        
+        # Translation: t = -R @ position
+        t = -R_cam @ position
+        # print(f"t: {t.shape()}")
+        
+        # Extrinsics matrix [R|t]
+        Rt = np.hstack([R_cam, t.reshape(3, 1)]).astype(np.float32)
+        print(f"Rt: {Rt}")
     
-    # Down vector (negative of up, perpendicular to right and forward)
-    down = -np.cross(right, forward)
-    down = down / (np.linalg.norm(down) + 1e-8)
-    
-    # OpenCV camera: Rt = [R|t] where:
-    # - R rows are: right, down, forward (in world coordinates)
-    # - t = -R @ position
-    R = np.array([
-        right,
-        down,
-        forward
-    ], dtype=np.float32)
-    
-    # Translation: t = -R @ position
-    t = -R @ position
-    
-    # Extrinsics matrix [R|t]
-    Rt = np.hstack([R, t.reshape(3, 1)]).astype(np.float32)
-    
-    # Intrinsics (simple pinhole camera)
-    fov = 60  # degrees
-    f = max(cols, rows) / 2.0 / np.tan(np.radians(fov / 2))
-    K = np.array([
-        [f, 0, cols / 2],
-        [0, f, rows / 2],
-        [0, 0, 1]
-    ], dtype=np.float32)
+    # Load intrinsics from intri.yml if provided
+    dist_coeffs = None
+    if intri_path is not None:
+        K_loaded, dist_coeffs_loaded = load_intri_yml(intri_path, camera_id)
+        if K_loaded is not None:
+            K = K_loaded.astype(np.float32)
+            dist_coeffs = dist_coeffs_loaded.astype(np.float32) if dist_coeffs_loaded is not None else None
+            print(f"Using intrinsics from intri.yml for camera {camera_id}")
+        else:
+            print("Warning: Failed to load intrinsics, using default intrinsics")
+            # Fall back to default intrinsics
+            fov = 60  # degrees
+            f = max(cols, rows) / 2.0 / np.tan(np.radians(fov / 2))
+            K = np.array([
+                [f, 0, cols / 2],
+                [0, f, rows / 2],
+                [0, 0, 1]
+            ], dtype=np.float32)
+    else:
+        # Default intrinsics (simple pinhole camera)
+        fov = 60  # degrees
+        f = max(cols, rows) / 2.0 / np.tan(np.radians(fov / 2))
+        K = np.array([
+            [f, 0, cols / 2],
+            [0, f, rows / 2],
+            [0, 0, 1]
+        ], dtype=np.float32)
     
     # Create OpenCV camera with n_frames matching video
     num_frames = len(frames)
@@ -306,6 +479,7 @@ def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_pos
         Rt=Rt_expanded,
         cols=cols,
         rows=rows,
+        dist_coeffs=dist_coeffs,
         viewer=viewer,
         name="Camera"
     )
@@ -388,17 +562,17 @@ def create_example_cameras(viewer, num_cameras=4, distance=5.0):
         # OpenCV camera: Rt = [R|t] where:
         # - R rows are: right, down, forward (in world coordinates)
         # - t = -R @ position
-        R = np.array([
+        R_cam = np.array([
             right,
             down,
             forward
         ], dtype=np.float32)
         
         # Translation: t = -R @ position
-        t = -R @ position
+        t = -R_cam @ position
         
         # Extrinsics matrix [R|t]
-        Rt = np.hstack([R, t.reshape(3, 1)]).astype(np.float32)
+        Rt = np.hstack([R_cam, t.reshape(3, 1)]).astype(np.float32)
         
         # Intrinsics (simple pinhole camera)
         fov = 60  # degrees
@@ -478,6 +652,24 @@ if __name__ == "__main__":
         default=None,
         help="Path to camera video file (e.g., MP4) to display on billboard"
     )
+    parser.add_argument(
+        "--extri-path",
+        type=str,
+        default=None,
+        help="Path to extri.yml file with camera extrinsics (optional, uses camera 1 by default)"
+    )
+    parser.add_argument(
+        "--intri-path",
+        type=str,
+        default=None,
+        help="Path to intri.yml file with camera intrinsics (optional, uses camera 1 by default)"
+    )
+    parser.add_argument(
+        "--camera-id",
+        type=int,
+        default=1,
+        help="Camera ID to use from extri.yml and intri.yml (1-9, default: 1)"
+    )
     
     args = parser.parse_args()
     
@@ -533,7 +725,10 @@ if __name__ == "__main__":
         camera, billboard = create_single_camera_with_video(
             viewer, 
             args.camera_video, 
-            distance=5.0
+            distance=5.0,
+            extri_path=args.extri_path,
+            intri_path=args.intri_path,
+            camera_id=args.camera_id
         )
         
         if camera is not None and billboard is not None:

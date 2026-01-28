@@ -26,6 +26,7 @@ if _parent_dir not in sys.path:
 from aitviewer.viewer import Viewer
 from aitviewer.renderables.smpl import SMPLSequence
 from aitviewer.scene.camera import OpenCVCamera
+from aitviewer.utils.so3 import aa2rot_numpy
 
 try:
     from convert_animation import convert_to_aitviewer_format
@@ -227,6 +228,11 @@ class CapViewer(Viewer):
         poses_root = data.get('poses_root', None)  # (F, 3) or None
         betas = data.get('betas', None)  # (10,) or None
         trans = data.get('trans', None)  # (F, 3) or None
+        # print(f"data: {data}")
+        # print(f"poses_body: {poses_body}")
+        # print(f"poses_root: {poses_root}")
+        # print(f"betas: {betas}")
+        # print(f"trans: {trans}")
         
         print(f"Loaded data shapes:")
         print(f"  poses_body: {poses_body.shape}")
@@ -261,13 +267,18 @@ class CapViewer(Viewer):
                 print(f"Error: Failed to create SMPL layer: {e2}")
                 raise
         
-        # Create SMPL sequence
+        # Create SMPL sequence with rotation to fix orientation
+        # Rotate -90 degrees around X axis to make person upright
+        # This matches the coordinate transformation used in json_to_pkl_parser.py
+        rotation_matrix = aa2rot_numpy(np.array([1, 0, 0]) * -np.pi/2)  # rot_x_-90
+        
         seq = SMPLSequence(
             poses_body=poses_body,
             poses_root=poses_root,
             betas=betas,
             trans=trans,
             smpl_layer=smpl_layer,
+            rotation=rotation_matrix,
             name="SMPLX from PKL",
         )
         
