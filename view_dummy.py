@@ -371,17 +371,22 @@ def create_single_camera_with_video(viewer, video_path, distance=5.0, camera_pos
             # This matches apply_rotation_matrix_to_aa in json_to_pkl_parser.py (line 77)
             Rot_transformed = (rot_x_minus_90 @ Rot).astype(np.float32)
             
-            # For translation vector T: T is world-to-camera translation
-            # When we rotate the coordinate system, we need to transform T accordingly
-            # But if direction is correct and only position is wrong, try not rotating T
+            # Apply rotation to translation vector: T_new = R_transform @ T_old
+            # This matches apply_rotation_matrix_to_translation in json_to_pkl_parser.py (line 106)
             # Ensure T is column vector for matrix multiplication
             if T.shape[1] != 1:
                 T = T.reshape(-1, 1)
+            T_transformed = (rot_x_minus_90 @ T).astype(np.float32)
             
-            # Try: don't rotate T, use original T
-            # This might fix the position issue while keeping the correct direction
+            # Hardcoded offset for camera 1: translate -2 along X, +1 along Z
+            # This offset is in the transformed coordinate system (after rot_x_-90)
+            offset = np.array([[-2.0], [0.0], [1.0]], dtype=np.float32)
+            T_adjusted = T_transformed + offset
+            
+            # OpenCV format: Rt = [R|t] where t is the translation from world to camera
+            # T_adjusted is the world-to-camera translation vector (after rot_x_-90 and hardcoded offset)
             Rot_cam = Rot_transformed
-            t = T.astype(np.float32)  # Use original T without rotation
+            t = T_adjusted.astype(np.float32)
             
             # Extrinsics matrix [R|t]
             Rt = np.hstack([Rot_cam, t]).astype(np.float32)
