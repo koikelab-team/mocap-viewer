@@ -152,6 +152,10 @@ def swap_axes_rotation(rot, axis_swap='yz'):
         # Rotate -90 degrees around Z axis
         rot_matrix = R.from_euler('z', -90, degrees=True).as_matrix()
         return apply_rotation_matrix_to_aa(rot, rot_matrix)
+    elif axis_swap == 'rot_z_180':
+        # Rotate 180 degrees around Z axis
+        rot_matrix = R.from_euler('z', 180, degrees=True).as_matrix()
+        return apply_rotation_matrix_to_aa(rot, rot_matrix)
     elif axis_swap == 'yz':
         # Swap Y and Z rotation axes
         rot_swapped = rot.copy()
@@ -683,6 +687,8 @@ def convert_all_json_to_single_pkl(input_dir, output_path=None, axis_swap=None):
                 rot_matrix = R.from_euler('z', 90, degrees=True).as_matrix()
             elif axis_swap == 'rot_z_-90':
                 rot_matrix = R.from_euler('z', -90, degrees=True).as_matrix()
+            elif axis_swap == 'rot_z_180':
+                rot_matrix = R.from_euler('z', 180, degrees=True).as_matrix()
             else:
                 rot_matrix = None
             
@@ -781,8 +787,8 @@ if __name__ == "__main__":
     parser.add_argument("--separate", action="store_true", help="Convert each JSON file separately (default: merge all into one)")
     parser.add_argument("--axis-swap", type=str, default=None, 
                        choices=['yz', 'xz', 'xy', 'zyx', 'neg_y', 'neg_z', 'neg_x', 'yz_neg_y', 'yz_neg_z',
-                                'rot_x_90', 'rot_x_-90', 'rot_y_90', 'rot_y_-90', 'rot_z_90', 'rot_z_-90'],
-                       help="Transform rotation axes (translation unchanged). Options include axis swaps and rotations (rot_x_90, rot_y_90, etc.)")
+                                'rot_x_90', 'rot_x_-90', 'rot_y_90', 'rot_y_-90', 'rot_z_90', 'rot_z_-90', 'rot_z_180'],
+                       help="Transform rotation axes. Options include axis swaps and rotations (rot_x_90, rot_y_90, rot_z_180, etc.)")
     
     args = parser.parse_args()
     
